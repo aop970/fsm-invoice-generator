@@ -9,4 +9,9 @@ export default defineConfig({
     tailwindcss(),
     react(),
   ],
+  server: {
+    proxy: {
+      '/generate': 'http://localhost:3001',
+    },
+  },
 })
