@@ -10,10 +10,103 @@ import {
   buildWorkbook, buildFilename,
   downloadWorkbook,
 } from './lib/writer';
+import type { NhfParams } from './lib/writer';
 import type { AnyReport } from './lib/types';
 
 type AppMode = 'weekly' | 'invoice';
 type Step = 'idle' | 'processing' | 'done' | 'error';
+
+// ── NHF acquisition method options ────────────────────────────────────────
+const NHF_OPTIONS: { label: string; rate: number }[] = [
+  { label: 'New Hire',          rate: 395 },
+  { label: 'In Talent Network', rate: 395 },
+  { label: '2020 Transfer',     rate: 285 },
+];
+
+// ── NHF Modal ─────────────────────────────────────────────────────────────
+
+interface NhfModalProps {
+  onConfirm: (params: NhfParams) => void;
+  onSkip: () => void;
+}
+
+function NhfModal({ onConfirm, onSkip }: NhfModalProps) {
+  const [count, setCount]       = useState(1);
+  const [optionIdx, setOptionIdx] = useState(0);
+
+  const selected = NHF_OPTIONS[optionIdx];
+
+  const handleConfirm = () => {
+    if (count < 1) return;
+    onConfirm({ count, rate: selected.rate, label: selected.label });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+      <div className="w-full max-w-sm rounded-2xl border border-slate-600 bg-slate-900 p-6 shadow-xl space-y-5">
+        <h2 className="text-base font-bold text-white">New Hires This Period?</h2>
+
+        <div className="space-y-3">
+          <div>
+            <label className="text-xs font-medium text-slate-400 uppercase tracking-wider block mb-1">
+              Number of New Hires
+            </label>
+            <input
+              type="number"
+              min={1}
+              value={count}
+              onChange={e => setCount(Math.max(1, parseInt(e.target.value) || 1))}
+              className="w-full rounded-lg bg-slate-800 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+            />
+          </div>
+
+          <div>
+            <label className="text-xs font-medium text-slate-400 uppercase tracking-wider block mb-1">
+              Acquisition Method
+            </label>
+            <div className="space-y-2">
+              {NHF_OPTIONS.map((opt, i) => (
+                <label key={opt.label} className="flex items-center gap-3 cursor-pointer group">
+                  <input
+                    type="radio"
+                    name="nhf-method"
+                    checked={optionIdx === i}
+                    onChange={() => setOptionIdx(i)}
+                    className="accent-blue-500"
+                  />
+                  <span className="text-sm text-slate-200">{opt.label}</span>
+                  <span className="text-xs text-slate-400 ml-auto">${opt.rate.toFixed(2)}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-lg bg-slate-800 px-4 py-2 text-sm text-slate-300">
+            Total NHF: <span className="text-white font-semibold">
+              ${(count * selected.rate).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            </span>
+            <span className="text-slate-400 ml-1">({count} × ${selected.rate})</span>
+          </div>
+        </div>
+
+        <div className="flex gap-3 pt-1">
+          <button
+            onClick={onSkip}
+            className="flex-1 rounded-xl border border-slate-600 bg-slate-800 text-slate-300 hover:bg-slate-700 py-2.5 text-sm font-medium transition-colors"
+          >
+            No New Hires
+          </button>
+          <button
+            onClick={handleConfirm}
+            className="flex-1 rounded-xl bg-blue-600 hover:bg-blue-500 text-white py-2.5 text-sm font-semibold transition-colors"
+          >
+            Add NHF
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 let logCounter = 0;
 
@@ -95,6 +188,10 @@ export default function App() {
   const [logs, setLogs]       = useState<LogEntry[]>([]);
   const [summary, setSummary] = useState<AnyReport | null>(null);
   const [filename, setFilename] = useState<string>('FSM-Report.xlsx');
+  const [nhf, setNhf]         = useState<NhfParams | null>(null);
+
+  // NHF modal state: null = not showing; 'pending' = showing modal before generate
+  const [nhfModal, setNhfModal] = useState<'pending' | null>(null);
 
   const summaryRef = useRef<HTMLDivElement | null>(null);
 
@@ -114,12 +211,11 @@ export default function App() {
     setSummary(null);
   };
 
-  const handleGenerate = async () => {
-    if (!canGenerate) return;
-
+  const runGenerate = useCallback(async (resolvedNhf: NhfParams | null) => {
     setStep('processing');
     setSummary(null);
     setLogs([]);
+    setNhf(resolvedNhf);
 
     try {
       if (mode === 'weekly') {
@@ -136,7 +232,7 @@ export default function App() {
         log(`FSM I: ${rpt.fsmI.length} rows  |  FSM II: ${rpt.fsmII.length} rows`, 'info');
 
         log('Building Excel workbook…', 'progress');
-        const wb = buildWeeklyWorkbook(rpt);
+        const wb = buildWeeklyWorkbook(rpt, resolvedNhf);
         const fn = buildWeeklyFilename(rpt.weeks);
         setFilename(fn);
         void wb;
@@ -175,7 +271,7 @@ export default function App() {
         log(`FSM I: ${inv.fsmI.length} rows  |  FSM II: ${inv.fsmII.length} rows  |  Mgmt: ${inv.mgmt.length} rows`, 'info');
 
         log('Building Excel workbook…', 'progress');
-        const wb = buildWorkbook(inv);
+        const wb = buildWorkbook(inv, resolvedNhf);
         const fn = buildFilename(inv.weeks);
         setFilename(fn);
         void wb;
@@ -191,21 +287,47 @@ export default function App() {
       log(`Error: ${msg}`, 'error');
       setStep('error');
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, wActW1, wToW1, iActW1, iActW2, iToW1, iToW2, iPto]);
+
+  const handleGenerate = () => {
+    if (!canGenerate) return;
+    // Invoice mode: show NHF modal before running
+    if (mode === 'invoice') {
+      setNhfModal('pending');
+    } else {
+      // Weekly mode: no NHF prompt, generate immediately with no NHF
+      void runGenerate(null);
+    }
+  };
+
+  const handleNhfConfirm = (params: NhfParams) => {
+    setNhfModal(null);
+    void runGenerate(params);
+  };
+
+  const handleNhfSkip = () => {
+    setNhfModal(null);
+    void runGenerate(null);
   };
 
   const handleDownload = useCallback(() => {
     if (!summary) return;
     if (summary.mode === 'weekly') {
-      const wb = buildWeeklyWorkbook(summary);
+      const wb = buildWeeklyWorkbook(summary, nhf);
       downloadWorkbook(wb, filename);
     } else {
-      const wb = buildWorkbook(summary);
+      const wb = buildWorkbook(summary, nhf);
       downloadWorkbook(wb, filename);
     }
-  }, [summary, filename]);
+  }, [summary, filename, nhf]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
+      {/* NHF Modal */}
+      {nhfModal === 'pending' && (
+        <NhfModal onConfirm={handleNhfConfirm} onSkip={handleNhfSkip} />
+      )}
       {/* Header */}
       <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">

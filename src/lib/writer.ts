@@ -3,14 +3,69 @@ import type { InvoiceSummary, WeeklySummary, InvoiceRow, MgmtRow } from './types
 import { MGMT_TABLE } from './constants';
 import { buildCoverPeriodStr, getWeekEndDate } from './transform';
 
-// ── Formatting helpers ─────────────────────────────────────────────────────
+// ── Number format strings ──────────────────────────────────────────────────
+const FMT_ACCOUNTING = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+const FMT_2DP        = '0.00';
+const FMT_DATE       = 'mm/dd/yyyy';
+const FMT_PCT        = '0.00%';
+const FMT_DOLLAR     = '"$"#,##0.00';
+
+// ── Style builders ─────────────────────────────────────────────────────────
+
+type CellStyle = {
+  font?: { bold?: boolean; sz?: number; name?: string };
+  fill?: { fgColor?: { rgb: string }; patternType?: string };
+  numFmt?: string;
+  alignment?: { horizontal?: string; vertical?: string; wrapText?: boolean };
+};
+
+function boldStyle(): CellStyle {
+  return { font: { bold: true } };
+}
+
+function boldAccounting(): CellStyle {
+  return { font: { bold: true }, numFmt: FMT_ACCOUNTING };
+}
+
+function yellowStyle(): CellStyle {
+  return { fill: { fgColor: { rgb: 'FFFF00' }, patternType: 'solid' } };
+}
+
+function yellowAccountingStyle(): CellStyle {
+  return {
+    fill: { fgColor: { rgb: 'FFFF00' }, patternType: 'solid' },
+    numFmt: FMT_ACCOUNTING,
+  };
+}
+
+function numFmtStyle(fmt: string): CellStyle {
+  return { numFmt: fmt };
+}
+
+/** Apply a style object to a specific cell ref in a worksheet. */
+function styleCell(ws: XLSX.WorkSheet, cellRef: string, style: CellStyle) {
+  const cell = ws[cellRef];
+  if (!cell) return;
+  // Merge — preserve existing z (number format) only if we are not overriding
+  cell.s = { ...(cell.s ?? {}), ...style };
+  // If numFmt is provided, also set the z property (SheetJS uses both)
+  if (style.numFmt) {
+    cell.z = style.numFmt;
+  }
+}
+
+/** Apply a style to a range of cells (e.g. row 2, cols A–T). */
+function styleRow(ws: XLSX.WorkSheet, rowIdx: number, colStart: number, colEnd: number, style: CellStyle) {
+  for (let c = colStart; c <= colEnd; c++) {
+    const ref = XLSX.utils.encode_cell({ r: rowIdx, c });
+    styleCell(ws, ref, style);
+  }
+}
+
+// ── Formatting helpers (string) ────────────────────────────────────────────
 
 function fmt(n: number): string {
   return n.toFixed(2);
-}
-
-function pctFmt(n: number): string {
-  return (n * 100).toFixed(2) + '%';
 }
 
 // ── Labor tab builder (FSM I / FSM II) ────────────────────────────────────
@@ -62,7 +117,7 @@ function buildLaborTab(
   metaRow[2]  = uniqueAssociateCount; // col C — unique associate count
   metaRow[13] = otHours;              // col N — total OT hours
   metaRow[14] = otLabel;              // col O — OT rate label string
-  metaRow[17] = tabTotal;             // col R — total Bill
+  metaRow[17] = tabTotal;             // col R — total Bill (number, styled with accounting fmt)
 
   // Row 2: headers
   const headerRow: unknown[] = [
@@ -102,12 +157,12 @@ function buildLaborTab(
       r.associateState,   // J
       r.storeState,       // K
       r.zipCode,          // L
-      r.visitDate,        // M
+      r.visitDate,        // M — kept as string; styled with date fmt below
       r.timeHours,        // N
-      fmt(r.basePayRate), // O
+      r.basePayRate,      // O — number, styled 0.00
       fmt(r.mu),          // P
-      fmt(r.payRateTotal),// Q
-      fmt(r.bill),        // R
+      r.payRateTotal,     // Q — number, styled 0.00
+      r.bill,             // R — number, styled accounting
       r.comments,         // S
     ];
     if (extraEmptyCol) row.push(''); // T
@@ -115,6 +170,34 @@ function buildLaborTab(
   });
 
   return [metaRow, headerRow, ...dataRows];
+}
+
+/** Apply formatting to an FSM I or FSM II worksheet after aoa_to_sheet. */
+function applyLaborStyles(ws: XLSX.WorkSheet, numDataRows: number, hasExtraCol: boolean) {
+  const lastCol = hasExtraCol ? 19 : 18; // T=19, S=18 (0-based)
+
+  // Row 1 (idx 0) metadata cells:
+  //   N1 (col 13): 0.00
+  //   O1 (col 14): already a string label — skip
+  //   R1 (col 17): accounting $
+  styleCell(ws, XLSX.utils.encode_cell({ r: 0, c: 13 }), numFmtStyle(FMT_2DP));
+  styleCell(ws, XLSX.utils.encode_cell({ r: 0, c: 17 }), numFmtStyle(FMT_ACCOUNTING));
+
+  // Row 2 (idx 1) headers: bold all columns
+  styleRow(ws, 1, 0, lastCol, boldStyle());
+
+  // Data rows (idx 2+):
+  for (let i = 0; i < numDataRows; i++) {
+    const r = i + 2;
+    // M (col 12): date format
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 12 }), numFmtStyle(FMT_DATE));
+    // O (col 14): 0.00 — base pay rate (number)
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 14 }), numFmtStyle(FMT_2DP));
+    // Q (col 16): 0.00 — pay rate total
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 16 }), numFmtStyle(FMT_2DP));
+    // R (col 17): accounting $
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 17 }), numFmtStyle(FMT_ACCOUNTING));
+  }
 }
 
 // ── Management Detail tab builder ──────────────────────────────────────────
@@ -145,8 +228,8 @@ function buildMgmtTab(rows: MgmtRow[]): unknown[][] {
 
   // Row 1: metadata
   const metaRow: unknown[] = new Array(numCols).fill('');
-  metaRow[2]  = rows.length; // col C — count of data rows (28 per week × number of weeks)
-  metaRow[9]  = grandTotalBill;  // col J — total bill
+  metaRow[2]  = rows.length;      // col C — count of data rows
+  metaRow[9]  = grandTotalBill;   // col J — total bill (number, styled accounting + yellow)
 
   // Row 2: headers
   const headerRow: unknown[] = [
@@ -171,17 +254,44 @@ function buildMgmtTab(rows: MgmtRow[]): unknown[][] {
     r.associateId,             // C
     r.title,                   // D
     r.associateState,          // E
-    r.hours,                   // F
-    fmt(r.hourlyRate),         // G
-    fmt(r.total),              // H
-    pctFmt(r.allocationPct),   // I
-    fmt(r.totalBill),          // J
+    r.hours,                   // F — number, styled 0.00
+    r.hourlyRate,              // G — number, styled "$"#,##0.00
+    r.total,                   // H — number, styled accounting
+    r.allocationPct,           // I — number, styled 0.00%
+    r.totalBill,               // J — number, styled accounting
     '',                        // K (Comments — blank)
     '',                        // L
     '',                        // M
   ]);
 
   return [metaRow, headerRow, ...dataRows];
+}
+
+/** Apply formatting to the Management Detail worksheet. */
+function applyMgmtStyles(ws: XLSX.WorkSheet, numDataRows: number) {
+  // Row 1 (idx 0): J1 (col 9) — yellow fill + accounting
+  styleCell(ws, XLSX.utils.encode_cell({ r: 0, c: 9 }), yellowAccountingStyle());
+
+  // Row 2 (idx 1): bold all headers (13 cols)
+  styleRow(ws, 1, 0, 12, boldStyle());
+
+  // Data rows (idx 2+)
+  for (let i = 0; i < numDataRows; i++) {
+    const r = i + 2;
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 5 }),  numFmtStyle(FMT_2DP));        // F: Hours
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 6 }),  numFmtStyle(FMT_DOLLAR));     // G: Hourly Rate
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 7 }),  numFmtStyle(FMT_ACCOUNTING)); // H: Total
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 8 }),  numFmtStyle(FMT_PCT));        // I: % Allocation
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 9 }),  numFmtStyle(FMT_ACCOUNTING)); // J: Total Bill
+  }
+}
+
+// ── New Hire Fee params ────────────────────────────────────────────────────
+
+export interface NhfParams {
+  count: number;
+  rate: number; // 285 or 395
+  label: string; // e.g. "2020 Transfer", "In Talent Network", "New Hire"
 }
 
 // ── Cover Tab builder ──────────────────────────────────────────────────────
@@ -195,7 +305,7 @@ function buildMgmtTab(rows: MgmtRow[]): unknown[][] {
 //   Subtotal row
 //   2 rows gap
 //   Secondary section header
-//   Secondary section rows (Cloud Services, Remote Management Software)
+//   Secondary section rows (Cloud Services MGR, Cloud Services FT, NHF if present)
 //   Grand Totals row
 
 interface CoverParams {
@@ -208,9 +318,10 @@ interface CoverParams {
   fsmITotal: number;
   fsmIITotal: number;
   mgmtTotal: number;
+  nhf: NhfParams | null;     // null = no new hires
 }
 
-function buildCoverTab(p: CoverParams): unknown[][] {
+function buildCoverTab(p: CoverParams): { data: unknown[][]; subtotalRowIdx: number; secondaryHeaderRowIdx: number; lastDataRowIdx: number } {
   // We build the sheet as a sparse array-of-arrays (row index 0-based, col index 0-based).
   // Column mapping: A=0, B=1, C=2, D=3, E=4
   // Row mapping:    row N in spec → index N-1 in array
@@ -249,10 +360,7 @@ function buildCoverTab(p: CoverParams): unknown[][] {
   if (p.weekEndDate) {
     const invDate = new Date(p.weekEndDate);
     invDate.setDate(invDate.getDate() + 2);
-    // Store as Excel serial date so Excel formats it as a date
-    const invSerial = XLSX.SSF.parse_date_code
-      ? dateToExcelSerial(invDate)
-      : formatDateMDY(invDate);
+    const invSerial = dateToExcelSerial(invDate);
     setCell(14, 4, invSerial);
   }
 
@@ -272,11 +380,36 @@ function buildCoverTab(p: CoverParams): unknown[][] {
 
   setCell(17, 0, 'm.compean@partner.sea.samsung.com');
 
+  // ── Compute secondary section totals ─────────────────────────────────────
+  // Cloud Services — MGR: count distinct managers with totalBill > 0
+  const mgmtByAssocForCloud = new Map<string, number>();
+  for (const r of p.mgmtRows) {
+    mgmtByAssocForCloud.set(r.associateId, (mgmtByAssocForCloud.get(r.associateId) ?? 0) + r.totalBill);
+  }
+  const mgrCount = [...mgmtByAssocForCloud.values()].filter(v => v > 0).length;
+  const mgrRate = 54;
+  const mgrCloudTotal = mgrCount * mgrRate;
+
+  // Cloud Services — FT: count unique FT associate IDs across fsmI + fsmII
+  const ftIds = new Set<string>();
+  for (const r of [...p.fsmIRows, ...p.fsmIIRows]) {
+    if (r.associateType === 'FT') {
+      ftIds.add(r.associateId.trim());
+    }
+  }
+  const ftCount = ftIds.size;
+  const ftRate = 40;
+  const ftCloudTotal = ftCount * ftRate;
+
+  // NHF total
+  const nhfTotal = p.nhf ? p.nhf.count * p.nhf.rate : 0;
+
+  // ── Total Due = mgmt + FSM I + FSM II + cloud services + NHF ─────────────
+  const primaryTotal = p.mgmtTotal + p.fsmITotal + p.fsmIITotal;
+  const grandTotal = primaryTotal + mgrCloudTotal + ftCloudTotal + nhfTotal;
+
   // ── Total Due (rows 20–21, idx 19–20) ────────────────────────────────────
   setCell(19, 4, 'Total Due');
-
-  // Grand total = mgmt + FSM I + FSM II
-  const grandTotal = p.mgmtTotal + p.fsmITotal + p.fsmIITotal;
   setCell(20, 4, grandTotal);
 
   // ── Line items table header (row 24, idx 23) ─────────────────────────────
@@ -341,14 +474,16 @@ function buildCoverTab(p: CoverParams): unknown[][] {
   dataRowIdx++;
 
   // ── Subtotal row ──────────────────────────────────────────────────────────
+  const subtotalRowIdx = dataRowIdx;
   setCell(dataRowIdx, 2, fsmIHours + fsmIIHours);
-  setCell(dataRowIdx, 4, grandTotal);
+  setCell(dataRowIdx, 4, primaryTotal);
   dataRowIdx++;
 
   // ── Gap (2 rows) ──────────────────────────────────────────────────────────
   dataRowIdx += 2;
 
   // ── Secondary section header ──────────────────────────────────────────────
+  const secondaryHeaderRowIdx = dataRowIdx;
   setCell(dataRowIdx, 0, 'Description');
   setCell(dataRowIdx, 1, 'Description');
   setCell(dataRowIdx, 2, 'QTY');
@@ -359,28 +494,100 @@ function buildCoverTab(p: CoverParams): unknown[][] {
   // ── Cloud Services — MGR row ──────────────────────────────────────────────
   setCell(dataRowIdx, 0, 'Cloud Services');
   setCell(dataRowIdx, 1, 'MGR');
-  setCell(dataRowIdx, 3, 'various');
+  setCell(dataRowIdx, 2, mgrCount);
+  setCell(dataRowIdx, 3, mgrRate);
+  setCell(dataRowIdx, 4, mgrCloudTotal);
   dataRowIdx++;
 
-  // ── Cloud Services — Field row ────────────────────────────────────────────
-  setCell(dataRowIdx, 1, 'Field');
-  setCell(dataRowIdx, 3, 40);
-  setCell(dataRowIdx, 4, 0);
+  // ── Cloud Services — FT row ───────────────────────────────────────────────
+  setCell(dataRowIdx, 0, 'Cloud Services');
+  setCell(dataRowIdx, 1, 'FT');
+  setCell(dataRowIdx, 2, ftCount);
+  setCell(dataRowIdx, 3, ftRate);
+  setCell(dataRowIdx, 4, ftCloudTotal);
   dataRowIdx++;
 
-  // ── Remote Management Software row ───────────────────────────────────────
-  setCell(dataRowIdx, 0, 'Remote Management Software');
-  setCell(dataRowIdx, 1, 'Jan');
-  setCell(dataRowIdx, 3, 42.22);
-  setCell(dataRowIdx, 4, 0);
-  dataRowIdx++;
+  // ── New Hire Fee row (only if NHF present) ────────────────────────────────
+  if (p.nhf) {
+    setCell(dataRowIdx, 0, 'New Hire Fee');
+    setCell(dataRowIdx, 1, p.nhf.label);
+    setCell(dataRowIdx, 2, p.nhf.count);
+    setCell(dataRowIdx, 3, p.nhf.rate);
+    setCell(dataRowIdx, 4, nhfTotal);
+    dataRowIdx++;
+  }
 
   // ── Grand Totals row ──────────────────────────────────────────────────────
+  const lastDataRowIdx = dataRowIdx;
   setCell(dataRowIdx, 0, 'Grand Totals');
-  setCell(dataRowIdx, 2, 0);
-  setCell(dataRowIdx, 4, 0);
+  setCell(dataRowIdx, 2, ftCount + mgrCount + (p.nhf ? p.nhf.count : 0));
+  setCell(dataRowIdx, 4, grandTotal);
 
-  return rows;
+  return { data: rows, subtotalRowIdx, secondaryHeaderRowIdx, lastDataRowIdx };
+}
+
+/** Apply formatting to the Cover worksheet. */
+function applyCoverStyles(
+  ws: XLSX.WorkSheet,
+  data: unknown[][],
+  subtotalRowIdx: number,
+  secondaryHeaderRowIdx: number,
+  lastDataRowIdx: number,
+) {
+  // A7 (idx 6): bold — company name
+  styleCell(ws, XLSX.utils.encode_cell({ r: 6, c: 0 }), boldStyle());
+
+  // D13–D17 (idx 12–16, col 3): bold — label column
+  for (let r = 12; r <= 16; r++) {
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 3 }), boldStyle());
+  }
+
+  // E13–E17 (idx 12–16, col 4): yellow fill — dynamic fields
+  for (let r = 12; r <= 16; r++) {
+    styleCell(ws, XLSX.utils.encode_cell({ r, c: 4 }), yellowStyle());
+  }
+
+  // E20 (idx 19): bold — "Total Due"
+  styleCell(ws, XLSX.utils.encode_cell({ r: 19, c: 4 }), boldStyle());
+
+  // E21 (idx 20): bold + accounting — grand total amount
+  styleCell(ws, XLSX.utils.encode_cell({ r: 20, c: 4 }), boldAccounting());
+
+  // Row 24 (idx 23) headers: bold all 5 cols
+  styleRow(ws, 23, 0, 4, boldStyle());
+
+  // Rows 25+ through subtotal row: bold all (management line items, FSM I, FSM II, subtotal)
+  for (let r = 24; r <= subtotalRowIdx; r++) {
+    styleRow(ws, r, 0, 4, boldStyle());
+  }
+
+  // Secondary section header: bold all 5 cols
+  styleRow(ws, secondaryHeaderRowIdx, 0, 4, boldStyle());
+
+  // Secondary section data rows: Cloud Services + NHF (rows between header and grand totals)
+  for (let r = secondaryHeaderRowIdx + 1; r <= lastDataRowIdx; r++) {
+    styleRow(ws, r, 0, 4, boldStyle());
+  }
+
+  // Grand Totals row: bold
+  styleRow(ws, lastDataRowIdx, 0, 4, boldStyle());
+
+  // Date cells: E15 and E16 (idx 14, 15) get date format (preserve yellow fill)
+  const dateRowIdxs = [14, 15];
+  for (const rowIdx of dateRowIdxs) {
+    const row = data[rowIdx];
+    if (!row) continue;
+    const val = row[4]; // col E
+    if (typeof val === 'number') {
+      const cellRef = XLSX.utils.encode_cell({ r: rowIdx, c: 4 });
+      const cell = ws[cellRef];
+      if (cell) {
+        cell.t = 'n';
+        cell.z = FMT_DATE;
+        cell.s = { ...(cell.s ?? {}), numFmt: FMT_DATE };
+      }
+    }
+  }
 }
 
 // ── Date helpers ──────────────────────────────────────────────────────────
@@ -391,12 +598,6 @@ function dateToExcelSerial(d: Date): number {
   const epoch = new Date(Date.UTC(1899, 11, 30)); // Dec 30 1899
   const utcDate = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
   return (utcDate - epoch.getTime()) / 86400000;
-}
-
-function formatDateMDY(d: Date): string {
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${mm}/${dd}/${d.getFullYear()}`;
 }
 
 // ── Invoice naming ────────────────────────────────────────────────────────
@@ -411,9 +612,15 @@ function buildInvoiceName(weeks: number[]): string {
   return `FSM${year}-W${w1}-${w2}`;
 }
 
+// ── Column width constants ─────────────────────────────────────────────────
+// Exact widths from reference invoice
+const FSM_I_WIDTHS  = [8.29, 24.86, 13.43, 15.71, 29.43, 36.43, 49.43, 30.71, 53.14, 16.14, 12.86, 10.43, 22.0, 12.43, 16.14, 8.43, 16.43, 13.0, 21.0, 6];
+const FSM_II_WIDTHS = FSM_I_WIDTHS.slice(0, 19);
+const MGMT_WIDTHS   = [8, 25.29, 11.71, 33.14, 16.86, 8.14, 8.14, 18.0, 11.0, 13.43, 13.43, 6, 6];
+
 // ── Weekly workbook (Mode 1) ────────────────────────────────────────────────
 
-export function buildWeeklyWorkbook(summary: WeeklySummary): XLSX.WorkBook {
+export function buildWeeklyWorkbook(summary: WeeklySummary, nhf: NhfParams | null = null): XLSX.WorkBook {
   const wb = XLSX.utils.book_new();
 
   // Collect visitDates from labor rows for cover tab date computations
@@ -423,7 +630,7 @@ export function buildWeeklyWorkbook(summary: WeeklySummary): XLSX.WorkBook {
   const invoiceName = buildInvoiceName(summary.weeks);
 
   // Cover tab — first tab, named after the invoice
-  const coverData = buildCoverTab({
+  const { data: coverData, subtotalRowIdx, secondaryHeaderRowIdx, lastDataRowIdx } = buildCoverTab({
     invoiceName,
     periodStr,
     weekEndDate,
@@ -433,29 +640,32 @@ export function buildWeeklyWorkbook(summary: WeeklySummary): XLSX.WorkBook {
     fsmITotal: summary.fsmITotal,
     fsmIITotal: summary.fsmIITotal,
     mgmtTotal: summary.mgmtTotal,
+    nhf,
   });
   const wsCover = XLSX.utils.aoa_to_sheet(coverData);
   applyColumnWidths(wsCover, [42, 10, 14, 20, 20]);
-  // Mark date cells in E15 and E16 as date format
-  applyCoverDateFormats(wsCover, coverData);
+  applyCoverStyles(wsCover, coverData, subtotalRowIdx, secondaryHeaderRowIdx, lastDataRowIdx);
   XLSX.utils.book_append_sheet(wb, wsCover, invoiceName);
 
   // FSM I — second tab
   const fsmIData = buildLaborTab(summary.fsmI, summary.fsmITotal, 'OT-15.53', true);
   const wsFsmI = XLSX.utils.aoa_to_sheet(fsmIData);
-  applyColumnWidths(wsFsmI, [8, 30, 14, 14, 20, 22, 28, 10, 40, 14, 12, 10, 14, 12, 14, 12, 14, 12, 20, 6]);
+  applyColumnWidths(wsFsmI, FSM_I_WIDTHS);
+  applyLaborStyles(wsFsmI, summary.fsmI.length, true);
   XLSX.utils.book_append_sheet(wb, wsFsmI, 'FSM I');
 
   // FSM II — third tab
   const fsmIIData = buildLaborTab(summary.fsmII, summary.fsmIITotal, 'OT-17.75', false);
   const wsFsmII = XLSX.utils.aoa_to_sheet(fsmIIData);
-  applyColumnWidths(wsFsmII, [8, 30, 14, 14, 20, 22, 28, 10, 40, 14, 12, 10, 14, 12, 14, 12, 14, 12, 20]);
+  applyColumnWidths(wsFsmII, FSM_II_WIDTHS);
+  applyLaborStyles(wsFsmII, summary.fsmII.length, false);
   XLSX.utils.book_append_sheet(wb, wsFsmII, 'FSM II');
 
   // Management Detail — fourth tab
   const mgmtData = buildMgmtTab(summary.mgmt);
   const wsMgmt = XLSX.utils.aoa_to_sheet(mgmtData);
-  applyColumnWidths(wsMgmt, [8, 32, 14, 35, 14, 8, 12, 14, 14, 12, 20, 6, 6]);
+  applyColumnWidths(wsMgmt, MGMT_WIDTHS);
+  applyMgmtStyles(wsMgmt, summary.mgmt.length);
   XLSX.utils.book_append_sheet(wb, wsMgmt, 'Management Detail Hours');
 
   return wb;
@@ -471,7 +681,7 @@ export function buildWeeklyFilename(weeks: number[]): string {
 
 // ── Client invoice workbook (Mode 2) ──────────────────────────────────────
 
-export function buildWorkbook(summary: InvoiceSummary): XLSX.WorkBook {
+export function buildWorkbook(summary: InvoiceSummary, nhf: NhfParams | null = null): XLSX.WorkBook {
   const wb = XLSX.utils.book_new();
 
   const allRows = [...summary.fsmI, ...summary.fsmII];
@@ -480,7 +690,7 @@ export function buildWorkbook(summary: InvoiceSummary): XLSX.WorkBook {
   const invoiceName = buildInvoiceName(summary.weeks);
 
   // Cover tab — first tab
-  const coverData = buildCoverTab({
+  const { data: coverData, subtotalRowIdx, secondaryHeaderRowIdx, lastDataRowIdx } = buildCoverTab({
     invoiceName,
     periodStr,
     weekEndDate,
@@ -490,28 +700,32 @@ export function buildWorkbook(summary: InvoiceSummary): XLSX.WorkBook {
     fsmITotal: summary.fsmITotal,
     fsmIITotal: summary.fsmIITotal,
     mgmtTotal: summary.mgmtTotal,
+    nhf,
   });
   const wsCover = XLSX.utils.aoa_to_sheet(coverData);
   applyColumnWidths(wsCover, [42, 10, 14, 20, 20]);
-  applyCoverDateFormats(wsCover, coverData);
+  applyCoverStyles(wsCover, coverData, subtotalRowIdx, secondaryHeaderRowIdx, lastDataRowIdx);
   XLSX.utils.book_append_sheet(wb, wsCover, invoiceName);
 
   // FSM I — second tab (20 columns with empty col T)
   const fsmIData = buildLaborTab(summary.fsmI, summary.fsmITotal, 'OT-15.53', true);
   const wsFsmI = XLSX.utils.aoa_to_sheet(fsmIData);
-  applyColumnWidths(wsFsmI, [8, 30, 14, 14, 20, 22, 28, 10, 40, 14, 12, 10, 14, 12, 14, 12, 14, 12, 20, 6]);
+  applyColumnWidths(wsFsmI, FSM_I_WIDTHS);
+  applyLaborStyles(wsFsmI, summary.fsmI.length, true);
   XLSX.utils.book_append_sheet(wb, wsFsmI, 'FSM I');
 
   // FSM II — third tab (19 columns, no col T)
   const fsmIIData = buildLaborTab(summary.fsmII, summary.fsmIITotal, 'OT-17.75', false);
   const wsFsmII = XLSX.utils.aoa_to_sheet(fsmIIData);
-  applyColumnWidths(wsFsmII, [8, 30, 14, 14, 20, 22, 28, 10, 40, 14, 12, 10, 14, 12, 14, 12, 14, 12, 20]);
+  applyColumnWidths(wsFsmII, FSM_II_WIDTHS);
+  applyLaborStyles(wsFsmII, summary.fsmII.length, false);
   XLSX.utils.book_append_sheet(wb, wsFsmII, 'FSM II');
 
   // Management Detail Hours — fourth tab (13 columns)
   const mgmtData = buildMgmtTab(summary.mgmt);
   const wsMgmt = XLSX.utils.aoa_to_sheet(mgmtData);
-  applyColumnWidths(wsMgmt, [8, 32, 14, 35, 14, 8, 12, 14, 14, 12, 20, 6, 6]);
+  applyColumnWidths(wsMgmt, MGMT_WIDTHS);
+  applyMgmtStyles(wsMgmt, summary.mgmt.length);
   XLSX.utils.book_append_sheet(wb, wsMgmt, 'Management Detail Hours');
 
   return wb;
@@ -519,28 +733,6 @@ export function buildWorkbook(summary: InvoiceSummary): XLSX.WorkBook {
 
 function applyColumnWidths(ws: XLSX.WorkSheet, widths: number[]) {
   ws['!cols'] = widths.map(w => ({ wch: w }));
-}
-
-/**
- * After aoa_to_sheet, mark the invoice date (E15, row idx 14) and due date (E16, row idx 15)
- * cells with Excel date number format so they render as dates in Excel.
- * We locate them by scanning the cover data for numeric values in column E rows 14–15.
- */
-function applyCoverDateFormats(ws: XLSX.WorkSheet, data: unknown[][]) {
-  // Row 14 (0-based) = spec row 15 (Invoice Date), Row 15 = spec row 16 (Due Date)
-  const dateRowIdxs = [14, 15];
-  for (const rowIdx of dateRowIdxs) {
-    const row = data[rowIdx];
-    if (!row) continue;
-    const val = row[4]; // col E
-    if (typeof val === 'number') {
-      const cellRef = XLSX.utils.encode_cell({ r: rowIdx, c: 4 });
-      if (ws[cellRef]) {
-        ws[cellRef].t = 'n';
-        ws[cellRef].z = 'mm/dd/yyyy';
-      }
-    }
-  }
 }
 
 /** Generate filename: FSM[YY]-W[WW].xlsx (single) or FSM[YY]-W[WW]-[WW].xlsx (bi-weekly) */
@@ -551,5 +743,5 @@ export function buildFilename(weeks: number[]): string {
 
 /** Trigger browser download of the workbook */
 export function downloadWorkbook(wb: XLSX.WorkBook, filename: string): void {
-  XLSX.writeFile(wb, filename);
+  XLSX.writeFile(wb, filename, { cellStyles: true });
 }
