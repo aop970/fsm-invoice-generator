@@ -3,12 +3,36 @@
  * Loads FSM_Invoice_TEMPLATE.xlsx, fills placeholders, writes data rows, returns buffer.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import XlsxPopulate from 'xlsx-populate';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const TEMPLATE_GITHUB_URL =
+  'https://raw.githubusercontent.com/aop970/fsm-invoice-generator/main/templates/FSM_Invoice_TEMPLATE.xlsx';
+
+async function loadWorkbook(): Promise<unknown> {
+  const localPath = path.resolve(__dirname, '../templates/FSM_Invoice_TEMPLATE.xlsx');
+  if (fs.existsSync(localPath)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (XlsxPopulate as any).fromFileAsync(localPath);
+  }
+  // Local file absent — fetch from GitHub (requires GITHUB_TOKEN for private repo)
+  const headers: Record<string, string> = {};
+  if (process.env.GITHUB_TOKEN) {
+    headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
+  }
+  const res = await fetch(TEMPLATE_GITHUB_URL, { headers });
+  if (!res.ok) {
+    throw new Error(`Template fetch failed: ${res.status} ${res.statusText}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (XlsxPopulate as any).fromDataAsync(buf);
+}
 
 // ── Types (mirror src/lib/types.ts — no imports across browser/server boundary) ──
 
@@ -120,9 +144,8 @@ function fmt2(n: number): string {
 // ── Main filler ───────────────────────────────────────────────────────────────
 
 export async function fillTemplate(payload: GeneratePayload): Promise<Buffer> {
-  const templatePath = path.resolve(__dirname, '../templates/FSM_Invoice_TEMPLATE.xlsx');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const wb = await (XlsxPopulate as any).fromFileAsync(templatePath);
+  const wb = await loadWorkbook() as any;
 
   // ── 1. INVOICE_TEMPLATE placeholders ──────────────────────────────────────
   const inv = wb.sheet('INVOICE_TEMPLATE');
